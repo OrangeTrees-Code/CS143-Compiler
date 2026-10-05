@@ -130,3 +130,17 @@ Instructions
 
 Write-up for PA3
 ----------------
+
+The parser builds the complete Cool abstract syntax tree directly in Bison
+semantic actions.  Classes contain ordered feature lists; methods contain
+ordered formal lists; and expressions cover assignment, dispatch (including
+static and implicit self dispatch), conditionals, loops, blocks, let, case,
+object creation, unary and binary operators, and literals.  Operator
+precedence follows the Cool reference grammar, while comma-separated let
+bindings are folded into nested `let` nodes from left to right.
+
+Error productions synchronize at class terminators, feature semicolons, block
+semicolons, and malformed let bindings.  This allows parsing to continue
+after local errors and report later classes and features.  `good.cl` exercises
+the legal constructs and precedence-sensitive expressions.  `bad.cl` checks
+recovery in features, classes, let bindings, and block expressions.

@@ -1,0 +1,5 @@
+"bad.cl", line 6: syntax error at or near ':'
+"bad.cl", line 12: syntax error at or near ';'
+"bad.cl", line 23: syntax error at or near ':'
+"bad.cl", line 24: syntax error at or near ';'
+Compilation halted due to lex and parse errors
