@@ -152,3 +152,41 @@ Instructions
 Write-up for PA5
 ----------------
 
+
+Implementation
+--------------
+
+The generator builds the inheritance tree and assigns preorder class tags. A
+class and all its descendants occupy a contiguous tag interval, allowing case
+branches to be tested in decreasing depth order. Each class layout copies its
+parent's attribute and method layouts; overrides replace a dispatch slot and
+new methods append slots. The same layouts drive prototype objects, class name
+and object tables, dispatch tables, initializers and expression generation.
+
+Expressions return an object pointer in $a0. Methods and initializers save $fp,
+$s0 and $ra; $s0 holds self. Actual arguments are evaluated left to right,
+pushed before the receiver, and removed by the callee. Lexical bindings and
+intermediate objects are stored on the stack, with offsets relative to $fp;
+their scopes are tracked while emitting code. Attributes live at fixed offsets
+in self. Parent initializers run first, followed by explicitly initialized
+attributes in source order. Basic type defaults are shared constants; other
+references default to void. Arithmetic copies an Int before modifying its value.
+new SELF_TYPE uses the runtime class tag to select both prototype and initializer.
+
+Dispatch and case expressions invoke the runtime abort routines on void, and
+case invokes the no-match abort if no branch applies. Assignments to attributes,
+including initializer stores, call _GenGC_Assign when the generational collector
+is selected. Values that must survive allocations reside on the scanned stack or
+in self, and the collector flags are passed through to the runtime.
+
+Testing
+-------
+
+example.cl exercises overriding, static and dynamic dispatch, inherited state,
+SELF_TYPE, case specificity, loops, arithmetic, strings and comparisons.
+tests/run.sh additionally checks nested scopes, argument order, default values,
+object and value equality, all three required runtime errors, and repeated
+allocation/attribute writes under -g -t. It uses the supplied reference front
+end and SPIM via qemu-i386 (set RUN32='' on a host that supports native i386).
+On systems where libfl requires an unresolved yylex, build with `make cgen LIB=`;
+the generated AST scanner already supplies the necessary scanner code.
