@@ -25,8 +25,8 @@
       #define YYLLOC_DEFAULT(Current, Rhs, N)         \
       Current = Rhs[1];                             \
       node_lineno = Current;
-    
-    
+
+
     #define SET_NODELOC(Current)  \
     node_lineno = Current;
     
@@ -71,11 +71,33 @@
     }
     
     */
-    
-    
+
+
     
     void yyerror(char *s);        /*  defined below; called for each parse error */
-    extern int yylex();           /*  the entry point to the lexer  */
+    /* libfl on newer systems references the traditional yylex symbol while
+       the supplied scanner exports cool_yylex.  Bison's prefix macro is
+       undefined around this compatibility wrapper. */
+    #ifdef yylex
+    #undef yylex
+    #endif
+    extern int cool_yylex();
+    extern "C" int yylex(void) { return cool_yylex(); }
+
+  /* A small temporary representation is used for comma-separated let
+     bindings; it is folded into nested let AST nodes once the body is read. */
+  struct LetBinding {
+    Symbol name;
+    Symbol type;
+    Expression init;
+    LetBinding *next;
+    LetBinding(Symbol n, Symbol t, Expression i)
+      : name(n), type(t), init(i), next(NULL) {}
+  };
+  static Expression make_let(LetBinding *b, Expression body) {
+    if (!b) return body;
+    return let(b->name, b->type, b->init, make_let(b->next, body));
+  }
     
     /************************************************************************/
     /*                DONT CHANGE ANYTHING IN THIS SECTION                  */
@@ -100,6 +122,7 @@
       Cases cases;
       Expression expression;
       Expressions expressions;
+      LetBinding *let_binding;
       char *error_msg;
     }
     
@@ -134,39 +157,196 @@
     %type <classes> class_list
     %type <class_> class
     
-    /* You will want to change the following line. */
-    %type <features> dummy_feature_list
-    
-    /* Precedence declarations go here. */
-    
-    
+    %type <features> dummy_feature_list feature_list
+    %type <feature> feature
+    %type <formals> formals formal_list
+    %type <formal> formal
+    %type <expression> expr
+    %type <expressions> actuals expr_list expr_list_no_semi
+    %type <cases> case_list
+    %type <case_> simple_case
+    %type <let_binding> let_binding let_bindings
+
+    /* Assignment is right associative.  Dispatch binds tighter than all
+       operators, followed by the unary operators, arithmetic, and tests. */
+    %right ASSIGN
+    %nonassoc LET_BODY
+    %right NOT
+    %left '<' LE '='
+    %left '+' '-'
+    %left '*' '/'
+    %right '~' ISVOID
+    %left '@' '.'
+
     %%
-    /* 
-    Save the root of the abstract syntax tree in a global variable.
-    */
-    program	: class_list	{ @$ = @1; ast_root = program($1); }
+    program : class_list
+      { @$ = @1; ast_root = program($1); }
     ;
-    
+
     class_list
-    : class			/* single class */
-    { $$ = single_Classes($1);
-    parse_results = $$; }
-    | class_list class	/* several classes */
-    { $$ = append_Classes($1,single_Classes($2)); 
-    parse_results = $$; }
+      : class
+        { $$ = single_Classes($1); parse_results = $$; }
+      | class_list class
+        { $$ = append_Classes($1, single_Classes($2)); parse_results = $$; }
     ;
-    
-    /* If no parent is specified, the class inherits from the Object class. */
-    class	: CLASS TYPEID '{' dummy_feature_list '}' ';'
-    { $$ = class_($2,idtable.add_string("Object"),$4,
-    stringtable.add_string(curr_filename)); }
-    | CLASS TYPEID INHERITS TYPEID '{' dummy_feature_list '}' ';'
-    { $$ = class_($2,$4,$6,stringtable.add_string(curr_filename)); }
+
+    /* If no parent is specified, the class inherits from Object.  The error
+       alternatives synchronize at the closing brace and semicolon so a bad
+       class does not hide following classes. */
+    class
+      : CLASS TYPEID '{' dummy_feature_list '}' ';'
+        { SET_NODELOC(@1); $$ = class_($2, idtable.add_string("Object"), $4,
+                                      stringtable.add_string(curr_filename)); }
+      | CLASS TYPEID INHERITS TYPEID '{' dummy_feature_list '}' ';'
+        { SET_NODELOC(@1); $$ = class_($2, $4, $6,
+                                      stringtable.add_string(curr_filename)); }
+      | CLASS TYPEID '{' error '}' ';'
+        { SET_NODELOC(@1); $$ = class_($2, idtable.add_string("Object"),
+                                      nil_Features(), stringtable.add_string(curr_filename)); }
+      | CLASS TYPEID INHERITS TYPEID '{' error '}' ';'
+        { SET_NODELOC(@1); $$ = class_($2, $4, nil_Features(),
+                                      stringtable.add_string(curr_filename)); }
+      | CLASS error '{' error '}' ';'
+        { SET_NODELOC(@1); $$ = class_(idtable.add_string("<error>"),
+                                      idtable.add_string("Object"), nil_Features(),
+                                      stringtable.add_string(curr_filename)); }
     ;
-    
-    /* Feature list may be empty, but no empty features in list. */
-    dummy_feature_list:		/* empty */
-    {  $$ = nil_Features(); }
+
+    dummy_feature_list
+      : /* empty */ { $$ = nil_Features(); }
+      | feature_list { $$ = $1; }
+    ;
+
+    feature_list
+      : feature { $$ = single_Features($1); }
+      | feature_list feature { $$ = append_Features($1, single_Features($2)); }
+      | feature_list error ';' { $$ = $1; }
+    ;
+
+    feature
+      : OBJECTID '(' formals ')' ':' TYPEID '{' expr '}' ';'
+        { SET_NODELOC(@1); $$ = method($1, $3, $6, $8); }
+      | OBJECTID ':' TYPEID ';'
+        { SET_NODELOC(@1); $$ = attr($1, $3, no_expr()); }
+      | OBJECTID ':' TYPEID ASSIGN expr ';'
+        { SET_NODELOC(@1); $$ = attr($1, $3, $5); }
+      /* A malformed feature is discarded by feature_list's error rule. */
+    ;
+
+    formals
+      : /* empty */ { $$ = nil_Formals(); }
+      | formal_list { $$ = $1; }
+    ;
+
+    formal_list
+      : formal { $$ = single_Formals($1); }
+      | formal_list ',' formal { $$ = append_Formals($1, single_Formals($3)); }
+      | formal_list ',' error { $$ = $1; }
+    ;
+
+    formal
+      : OBJECTID ':' TYPEID
+        { SET_NODELOC(@1); $$ = formal($1, $3); }
+    ;
+
+    /* The precedence declarations above encode the precedence in the Cool
+       reference manual.  The explicit %prec annotations make prefix forms
+       bind as expected and let extends as far right as possible. */
+    expr
+      : OBJECTID ASSIGN expr
+        { SET_NODELOC(@1); $$ = assign($1, $3); }
+      | expr '@' TYPEID '.' OBJECTID '(' actuals ')'
+        { SET_NODELOC(@1); $$ = static_dispatch($1, $3, $5, $7); }
+      | expr '.' OBJECTID '(' actuals ')'
+        { SET_NODELOC(@1); $$ = dispatch($1, $3, $5); }
+      | OBJECTID '(' actuals ')'
+        { SET_NODELOC(@1); $$ = dispatch(object(idtable.add_string("self")), $1, $3); }
+      | IF expr THEN expr ELSE expr FI
+        { SET_NODELOC(@1); $$ = cond($2, $4, $6); }
+      | WHILE expr LOOP expr POOL
+        { SET_NODELOC(@1); $$ = loop($2, $4); }
+      | '{' expr_list '}'
+        { SET_NODELOC(@1); $$ = block($2); }
+      | LET let_bindings IN expr %prec LET_BODY
+        { SET_NODELOC(@1); $$ = make_let($2, $4); }
+      | CASE expr OF case_list ESAC
+        { SET_NODELOC(@1); $$ = typcase($2, $4); }
+      | NEW TYPEID
+        { SET_NODELOC(@1); $$ = new_($2); }
+      | ISVOID expr %prec ISVOID
+        { SET_NODELOC(@1); $$ = isvoid($2); }
+      | expr '+' expr
+        { SET_NODELOC(@2); $$ = plus($1, $3); }
+      | expr '-' expr
+        { SET_NODELOC(@2); $$ = sub($1, $3); }
+      | expr '*' expr
+        { SET_NODELOC(@2); $$ = mul($1, $3); }
+      | expr '/' expr
+        { SET_NODELOC(@2); $$ = divide($1, $3); }
+      | '~' expr
+        { SET_NODELOC(@1); $$ = neg($2); }
+      | expr '<' expr
+        { SET_NODELOC(@2); $$ = lt($1, $3); }
+      | expr '=' expr
+        { SET_NODELOC(@2); $$ = eq($1, $3); }
+      | expr LE expr
+        { SET_NODELOC(@2); $$ = leq($1, $3); }
+      | NOT expr
+        { SET_NODELOC(@1); $$ = comp($2); }
+      | '(' expr ')'
+        { $$ = $2; }
+      | INT_CONST
+        { SET_NODELOC(@1); $$ = int_const($1); }
+      | STR_CONST
+        { SET_NODELOC(@1); $$ = string_const($1); }
+      | BOOL_CONST
+        { SET_NODELOC(@1); $$ = bool_const($1); }
+      | OBJECTID
+        { SET_NODELOC(@1); $$ = object($1); }
+    ;
+
+    actuals
+      : /* empty */ { $$ = nil_Expressions(); }
+      | expr_list_no_semi { $$ = $1; }
+    ;
+
+    let_bindings
+      : let_binding { $$ = $1; }
+      | let_bindings ',' let_binding
+        { $1->next = $3; $$ = $1; }
+    ;
+
+    let_binding
+      : OBJECTID ':' TYPEID
+        { $$ = new LetBinding($1, $3, no_expr()); }
+      | OBJECTID ':' TYPEID ASSIGN expr
+        { $$ = new LetBinding($1, $3, $5); }
+      | error
+        { $$ = new LetBinding(idtable.add_string("<error>"),
+                              idtable.add_string("Object"), no_expr()); }
+    ;
+
+    expr_list_no_semi
+      : expr { $$ = single_Expressions($1); }
+      | expr_list_no_semi ',' expr
+        { $$ = append_Expressions($1, single_Expressions($3)); }
+    ;
+
+    expr_list
+      : expr ';' { $$ = single_Expressions($1); }
+      | expr_list expr ';' { $$ = append_Expressions($1, single_Expressions($2)); }
+      | expr_list error ';' { $$ = append_Expressions($1, single_Expressions(no_expr())); }
+    ;
+
+    case_list
+      : simple_case { $$ = single_Cases($1); }
+      | case_list simple_case { $$ = append_Cases($1, single_Cases($2)); }
+    ;
+
+    simple_case
+      : OBJECTID ':' TYPEID DARROW expr ';'
+        { SET_NODELOC(@1); $$ = branch($1, $3, $5); }
+    ;
     
     
     /* end of grammar */
@@ -185,5 +365,4 @@
       
       if(omerrs>50) {fprintf(stdout, "More than 50 errors\n"); exit(1);}
     }
-    
-    
+

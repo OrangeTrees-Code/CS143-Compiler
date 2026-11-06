@@ -1,29 +1,28 @@
 
-(*
- *  execute "coolc bad.cl" to see the error messages that the coolc parser
- *  generates
- *
- *  execute "myparser bad.cl" to see the error messages that your parser
- *  generates
- *)
+(* Each malformed construct is followed by a synchronization token. *)
 
-(* no error *)
-class A {
+(* Bad feature, then a valid feature in the same class. *)
+class FeatureErrors {
+  broken(a : Int : Int;
+  ok : Int <- 0;
 };
 
-(* error:  b is not a type identifier *)
-Class b inherits A {
+(* Bad class body, then a valid class: class-level recovery. *)
+class BrokenClass {
+  missing : Int <- ;
 };
 
-(* error:  a is not a type identifier *)
-Class C inherits a {
+class AfterClassError {
+  value : Int <- 1;
 };
 
-(* error:  keyword inherits is misspelled *)
-Class D inherts A {
+(* Bad let binding and an expression error inside a block. *)
+class ExprErrors {
+  test() : Int {
+    {
+      let a : Int <- 1, : Int <- 2 in a;
+      1 + ;
+      3;
+    }
+  };
 };
-
-(* error:  closing brace is missing *)
-Class E inherits A {
-;
-

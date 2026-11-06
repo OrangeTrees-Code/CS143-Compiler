@@ -24,6 +24,9 @@
 
 #include "cgen.h"
 #include "cgen_gc.h"
+#include <vector>
+#include <map>
+#include <algorithm>
 
 extern void emit_string_constant(ostream& str, char *s);
 extern int cgen_debug;
@@ -402,7 +405,7 @@ void StringEntry::code_def(ostream& s, int stringclasstag)
       << WORD;
 
 
- /***** Add dispatch information for class String ******/
+ s << "String_dispTab";
 
       s << endl;                                              // dispatch table
       s << WORD;  lensym->code_ref(s);  s << endl;            // string length
@@ -444,7 +447,7 @@ void IntEntry::code_def(ostream &s, int intclasstag)
       << WORD << (DEFAULT_OBJFIELDS + INT_SLOTS) << endl  // object size
       << WORD; 
 
- /***** Add dispatch information for class Int ******/
+ s << "Int_dispTab";
 
       s << endl;                                          // dispatch table
       s << WORD << str << endl;                           // integer value
@@ -488,7 +491,7 @@ void BoolConst::code_def(ostream& s, int boolclasstag)
       << WORD << (DEFAULT_OBJFIELDS + BOOL_SLOTS) << endl   // object size
       << WORD;
 
- /***** Add dispatch information for class Bool ******/
+ s << "Bool_dispTab";
 
       s << endl;                                            // dispatch table
       s << WORD << val << endl;                             // value (0 or 1)
@@ -617,17 +620,89 @@ void CgenClassTable::code_constants()
 }
 
 
+// Tags are assigned in preorder, so every subtree occupies a contiguous interval.
+struct Layout {
+  CgenNodeP node;
+  int tag, last, depth;
+  std::vector<attr_class*> attrs;
+  std::vector<std::pair<Symbol, Symbol> > methods;
+};
+static std::vector<Layout> layouts;
+static std::map<Symbol, int> class_index;
+static int current_class, label_counter, stack_depth;
+struct Binding { Symbol name; int offset; bool attribute; };
+static std::vector<Binding> bindings;
+
+static void layout_class(CgenNodeP node, int parent, int depth) {
+  Layout l; l.node = node; l.tag = layouts.size(); l.last = l.tag; l.depth = depth;
+  if (parent >= 0) { l.attrs = layouts[parent].attrs; l.methods = layouts[parent].methods; }
+  for (int i=node->features->first(); node->features->more(i); i=node->features->next(i)) {
+    Feature f=node->features->nth(i);
+    if (attr_class *a=dynamic_cast<attr_class*>(f)) l.attrs.push_back(a);
+    if (method_class *m=dynamic_cast<method_class*>(f)) {
+      size_t j=0; while (j<l.methods.size() && l.methods[j].first != m->name) ++j;
+      if (j==l.methods.size()) l.methods.push_back(std::make_pair(m->name,node->name));
+      else l.methods[j].second=node->name;
+    }
+  }
+  int index=layouts.size(); class_index[node->name]=index; layouts.push_back(l);
+  for (List<CgenNode> *c=node->get_children(); c; c=c->tl()) layout_class(c->hd(),index,depth+1);
+  layouts[index].last=layouts.size()-1;
+}
+static int fresh() { return label_counter++; }
+static int method_offset(Symbol type, Symbol name) {
+  if (type==SELF_TYPE) type=layouts[current_class].node->name;
+  const auto &v=layouts[class_index.at(type)].methods;
+  for (size_t i=0;i<v.size();++i) if (v[i].first==name) return i;
+  assert(false); return 0;
+}
+static Binding lookup_binding(Symbol name) {
+  for (int i=(int)bindings.size()-1;i>=0;--i) if (bindings[i].name==name) return bindings[i];
+  assert(false); return Binding();
+}
+static void push_value(ostream &s) { emit_push(ACC,s); ++stack_depth; }
+static void pop_temp(char *reg, ostream &s) { emit_addiu(SP,SP,4,s); emit_load(reg,0,SP,s); --stack_depth; }
+static void default_value(Symbol type, ostream &s) {
+  if (type==Int) emit_load_int(ACC,inttable.lookup_string("0"),s);
+  else if (type==Bool) emit_load_bool(ACC,falsebool,s);
+  else if (type==Str) emit_load_string(ACC,stringtable.lookup_string(""),s);
+  else emit_move(ACC,ZERO,s);
+}
+static void store_binding(Binding b, ostream &s) {
+  emit_store(ACC,b.offset,(char *)(b.attribute ? SELF : FP),s);
+  if (b.attribute && cgen_Memmgr==GC_GENGC) {
+    emit_addiu(A1,SELF,b.offset*WORD_SIZE,s); emit_gc_assign(s);
+  }
+}
+static void prologue(ostream &s) {
+  emit_push(FP,s); emit_push(SELF,s); emit_push(RA,s);
+  emit_addiu(FP,SP,4,s); emit_move(SELF,ACC,s); stack_depth=0;
+}
+static void epilogue(int n, ostream &s) {
+  emit_load(RA,0,FP,s); emit_load(SELF,1,FP,s); emit_load(T1,2,FP,s);
+  emit_addiu(SP,FP,8+4*n,s); emit_move(FP,T1,s); emit_return(s);
+}
+static void setup_bindings(int index) {
+  bindings.clear();
+  for (size_t i=0;i<layouts[index].attrs.size();++i)
+    bindings.push_back({layouts[index].attrs[i]->name,(int)i+DEFAULT_OBJFIELDS,true});
+}
+static void abort_at(const char *routine, int line, ostream &s) {
+  emit_load_string(ACC,stringtable.lookup_string(layouts[current_class].node->filename->get_string()),s);
+  emit_load_imm(T1,line,s); s << JAL << routine << endl;
+}
 CgenClassTable::CgenClassTable(Classes classes, ostream& s) : nds(NULL) , str(s)
 {
-   stringclasstag = 0 /* Change to your String class tag here */;
-   intclasstag =    0 /* Change to your Int class tag here */;
-   boolclasstag =   0 /* Change to your Bool class tag here */;
+
 
    enterscope();
    if (cgen_debug) cout << "Building CgenClassTable" << endl;
    install_basic_classes();
    install_classes(classes);
    build_inheritance_tree();
+   layouts.clear(); class_index.clear(); label_counter=0;
+   layout_class(root(),-1,0);
+   stringclasstag=class_index[Str]; intclasstag=class_index[Int]; boolclasstag=class_index[Bool];
 
    code();
    exitscope();
@@ -817,33 +892,50 @@ void CgenNode::set_parentnd(CgenNodeP p)
 
 
 
-void CgenClassTable::code()
-{
-  if (cgen_debug) cout << "coding global data" << endl;
-  code_global_data();
-
-  if (cgen_debug) cout << "choosing gc" << endl;
-  code_select_gc();
-
-  if (cgen_debug) cout << "coding constants" << endl;
-  code_constants();
-
-//                 Add your code to emit
-//                   - prototype objects
-//                   - class_nameTab
-//                   - dispatch tables
-//
-
-  if (cgen_debug) cout << "coding global text" << endl;
+void CgenClassTable::code() {
+  code_global_data(); code_select_gc(); code_constants();
+  str << CLASSNAMETAB << LABEL;
+  for (const auto &l: layouts) { str << WORD; stringtable.lookup_string(l.node->name->get_string())->code_ref(str); str << endl; }
+  str << CLASSOBJTAB << LABEL;
+  for (const auto &l: layouts) str << WORD << l.node->name << PROTOBJ_SUFFIX << endl << WORD << l.node->name << CLASSINIT_SUFFIX << endl;
+  for (const auto &l: layouts) {
+    str << l.node->name << DISPTAB_SUFFIX << LABEL;
+    for (const auto &m: l.methods) str << WORD << m.second << METHOD_SEP << m.first << endl;
+    str << WORD << -1 << endl << l.node->name << PROTOBJ_SUFFIX << LABEL
+        << WORD << l.tag << endl << WORD << DEFAULT_OBJFIELDS+l.attrs.size() << endl
+        << WORD << l.node->name << DISPTAB_SUFFIX << endl;
+    for (auto a: l.attrs) {
+      str << WORD;
+      if (a->type_decl==Int) inttable.lookup_string("0")->code_ref(str);
+      else if (a->type_decl==Str) stringtable.lookup_string("")->code_ref(str);
+      else if (a->type_decl==Bool) falsebool.code_ref(str);
+      else str << 0;
+      str << endl;
+    }
+  }
   code_global_text();
-
-//                 Add your code to emit
-//                   - object initializer
-//                   - the class methods
-//                   - etc...
-
+  for (size_t i=0;i<layouts.size();++i) {
+    current_class=i; CgenNodeP node=layouts[i].node; setup_bindings(i);
+    str << node->name << CLASSINIT_SUFFIX << LABEL; prologue(str);
+    if (node->name!=Object) { emit_move(ACC,SELF,str); str << JAL << node->parent << CLASSINIT_SUFFIX << endl; }
+    for (int j=node->features->first();node->features->more(j);j=node->features->next(j)) {
+      attr_class *a=dynamic_cast<attr_class*>(node->features->nth(j));
+      if (a && !dynamic_cast<no_expr_class*>(a->init)) { a->init->code(str); store_binding(lookup_binding(a->name),str); }
+    }
+    emit_move(ACC,SELF,str); epilogue(0,str);
+    if (node->basic()) continue;
+    for (int j=node->features->first();node->features->more(j);j=node->features->next(j)) {
+      method_class *m=dynamic_cast<method_class*>(node->features->nth(j)); if (!m) continue;
+      setup_bindings(i); str << node->name << METHOD_SEP << m->name << LABEL; prologue(str);
+      int n=m->formals->len(), k=0;
+      for (int f=m->formals->first();m->formals->more(f);f=m->formals->next(f),++k) {
+        formal_class *formal=static_cast<formal_class*>(m->formals->nth(f));
+        bindings.push_back({formal->name,3+n-1-k,false});
+      }
+      m->expr->code(str); epilogue(n,str);
+    }
+  }
 }
-
 
 CgenNodeP CgenClassTable::root()
 {
@@ -877,85 +969,92 @@ CgenNode::CgenNode(Class_ nd, Basicness bstatus, CgenClassTableP ct) :
 //
 //*****************************************************************
 
-void assign_class::code(ostream &s) {
+// Expressions leave their result in $a0. Temporaries and lexical bindings live
+// on the scanned stack; stack_depth tracks their offsets from the frame pointer.
+void assign_class::code(ostream &s) { expr->code(s); store_binding(lookup_binding(name),s); }
+static void actuals(Expressions args, ostream &s) {
+  for (int i=args->first();args->more(i);i=args->next(i)) { args->nth(i)->code(s); push_value(s); }
 }
-
+static void dispatch_check(int line, ostream &s) {
+  int ok=fresh(); emit_bne(ACC,ZERO,ok,s); abort_at("_dispatch_abort",line,s); emit_label_def(ok,s);
+}
 void static_dispatch_class::code(ostream &s) {
+  actuals(actual,s); expr->code(s); dispatch_check(get_line_number(),s);
+  s << LA << T1 << " " << type_name << DISPTAB_SUFFIX << endl;
+  emit_load(T1,method_offset(type_name,name),T1,s); emit_jalr(T1,s); stack_depth-=actual->len();
 }
-
 void dispatch_class::code(ostream &s) {
+  actuals(actual,s); expr->code(s); dispatch_check(get_line_number(),s);
+  emit_load(T1,DISPTABLE_OFFSET,ACC,s); emit_load(T1,method_offset(expr->get_type(),name),T1,s);
+  emit_jalr(T1,s); stack_depth-=actual->len();
 }
-
 void cond_class::code(ostream &s) {
+  int no=fresh(), end=fresh(); pred->code(s); emit_fetch_int(T1,ACC,s); emit_beqz(T1,no,s);
+  then_exp->code(s); emit_branch(end,s); emit_label_def(no,s); else_exp->code(s); emit_label_def(end,s);
 }
-
 void loop_class::code(ostream &s) {
+  int start=fresh(), end=fresh(); emit_label_def(start,s); pred->code(s); emit_fetch_int(T1,ACC,s);
+  emit_beqz(T1,end,s); body->code(s); emit_branch(start,s); emit_label_def(end,s); emit_move(ACC,ZERO,s);
 }
-
 void typcase_class::code(ostream &s) {
+  expr->code(s); int nonvoid=fresh(), end=fresh(); emit_bne(ACC,ZERO,nonvoid,s);
+  abort_at("_case_abort2",get_line_number(),s); emit_label_def(nonvoid,s); push_value(s);
+  std::vector<branch_class*> branches;
+  for (int i=cases->first();cases->more(i);i=cases->next(i)) branches.push_back(static_cast<branch_class*>(cases->nth(i)));
+  std::sort(branches.begin(),branches.end(),[](branch_class *a,branch_class *b) { return layouts[class_index.at(a->type_decl)].depth > layouts[class_index.at(b->type_decl)].depth; });
+  for (auto b: branches) {
+    const Layout &l=layouts[class_index.at(b->type_decl)]; int next=fresh();
+    emit_load(T1,0,ACC,s); emit_blti(T1,l.tag,next,s); emit_bgti(T1,l.last,next,s);
+    bindings.push_back({b->name,-stack_depth,false}); b->expr->code(s); bindings.pop_back(); emit_branch(end,s); emit_label_def(next,s);
+  }
+  s << JAL << "_case_abort" << endl; emit_label_def(end,s); emit_addiu(SP,SP,4,s); --stack_depth;
 }
-
-void block_class::code(ostream &s) {
-}
-
+void block_class::code(ostream &s) { for(int i=body->first();body->more(i);i=body->next(i)) body->nth(i)->code(s); }
 void let_class::code(ostream &s) {
+  if (dynamic_cast<no_expr_class*>(init)) default_value(type_decl,s); else init->code(s);
+  push_value(s); bindings.push_back({identifier,-stack_depth,false}); body->code(s); bindings.pop_back();
+  emit_addiu(SP,SP,4,s); --stack_depth;
 }
-
-void plus_class::code(ostream &s) {
+static void arithmetic(Expression a, Expression b, const char *op, ostream &s) {
+  a->code(s); push_value(s); b->code(s); s << JAL << "Object.copy" << endl;
+  emit_fetch_int(T2,ACC,s); pop_temp(T1,s); emit_fetch_int(T1,T1,s);
+  s << "\t" << op << "\t" << T1 << " " << T1 << " " << T2 << endl; emit_store_int(T1,ACC,s);
 }
-
-void sub_class::code(ostream &s) {
+void plus_class::code(ostream &s) { arithmetic(e1,e2,"addu",s); }
+void sub_class::code(ostream &s) { arithmetic(e1,e2,"subu",s); }
+void mul_class::code(ostream &s) { arithmetic(e1,e2,"mul",s); }
+void divide_class::code(ostream &s) { arithmetic(e1,e2,"div",s); }
+void neg_class::code(ostream &s) { e1->code(s); s << JAL << "Object.copy" << endl; emit_fetch_int(T1,ACC,s); emit_neg(T1,T1,s); emit_store_int(T1,ACC,s); }
+static void compare(Expression a, Expression b, bool equal, ostream &s) {
+  a->code(s); push_value(s); b->code(s); emit_fetch_int(T2,ACC,s); pop_temp(T1,s); emit_fetch_int(T1,T1,s);
+  int yes=fresh(), end=fresh(); if (equal) emit_bleq(T1,T2,yes,s); else emit_blt(T1,T2,yes,s);
+  emit_load_bool(ACC,falsebool,s); emit_branch(end,s); emit_label_def(yes,s); emit_load_bool(ACC,truebool,s); emit_label_def(end,s);
 }
-
-void mul_class::code(ostream &s) {
-}
-
-void divide_class::code(ostream &s) {
-}
-
-void neg_class::code(ostream &s) {
-}
-
-void lt_class::code(ostream &s) {
-}
-
+void lt_class::code(ostream &s) { compare(e1,e2,false,s); }
+void leq_class::code(ostream &s) { compare(e1,e2,true,s); }
 void eq_class::code(ostream &s) {
+  e1->code(s); push_value(s); e2->code(s); emit_move(T2,ACC,s); pop_temp(T1,s);
+  int done=fresh(); emit_load_bool(ACC,truebool,s); emit_beq(T1,T2,done,s); emit_load_bool(A1,falsebool,s);
+  s << JAL << "equality_test" << endl; emit_label_def(done,s);
 }
-
-void leq_class::code(ostream &s) {
-}
-
 void comp_class::code(ostream &s) {
+  e1->code(s); emit_fetch_int(T1,ACC,s); int yes=fresh(), end=fresh(); emit_beqz(T1,yes,s);
+  emit_load_bool(ACC,falsebool,s); emit_branch(end,s); emit_label_def(yes,s); emit_load_bool(ACC,truebool,s); emit_label_def(end,s);
 }
-
-void int_const_class::code(ostream& s)  
-{
-  //
-  // Need to be sure we have an IntEntry *, not an arbitrary Symbol
-  //
-  emit_load_int(ACC,inttable.lookup_string(token->get_string()),s);
-}
-
-void string_const_class::code(ostream& s)
-{
-  emit_load_string(ACC,stringtable.lookup_string(token->get_string()),s);
-}
-
-void bool_const_class::code(ostream& s)
-{
-  emit_load_bool(ACC, BoolConst(val), s);
-}
-
+void int_const_class::code(ostream &s) { emit_load_int(ACC,inttable.lookup_string(token->get_string()),s); }
+void string_const_class::code(ostream &s) { emit_load_string(ACC,stringtable.lookup_string(token->get_string()),s); }
+void bool_const_class::code(ostream &s) { emit_load_bool(ACC,BoolConst(val),s); }
 void new__class::code(ostream &s) {
+  if (type_name==SELF_TYPE) {
+    emit_load(T1,TAG_OFFSET,SELF,s); emit_sll(T1,T1,3,s); s << LA << T2 << " " << CLASSOBJTAB << endl;
+    emit_addu(T1,T1,T2,s); emit_load(ACC,0,T1,s); s << JAL << "Object.copy" << endl;
+    emit_load(T1,TAG_OFFSET,ACC,s); emit_sll(T1,T1,3,s); s << LA << T2 << " " << CLASSOBJTAB << endl;
+    emit_addu(T1,T1,T2,s); emit_load(T1,1,T1,s); emit_jalr(T1,s);
+  } else { s << LA << ACC << " " << type_name << PROTOBJ_SUFFIX << endl << JAL << "Object.copy" << endl << JAL << type_name << CLASSINIT_SUFFIX << endl; }
 }
-
 void isvoid_class::code(ostream &s) {
+  e1->code(s); int yes=fresh(), end=fresh(); emit_beqz(ACC,yes,s); emit_load_bool(ACC,falsebool,s);
+  emit_branch(end,s); emit_label_def(yes,s); emit_load_bool(ACC,truebool,s); emit_label_def(end,s);
 }
-
-void no_expr_class::code(ostream &s) {
-}
-
-void object_class::code(ostream &s) {
-}
-
-
+void no_expr_class::code(ostream &s) { emit_move(ACC,ZERO,s); }
+void object_class::code(ostream &s) { if (name==self) emit_move(ACC,SELF,s); else { Binding b=lookup_binding(name); emit_load(ACC,b.offset,(char *)(b.attribute?SELF:FP),s); } }
